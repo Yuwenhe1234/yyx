@@ -1,0 +1,86 @@
+ESP32 DEVKIT PINOUT MAP
+
+Power and Control Pins:
+3V3      - 3.3V supply output
+GND      - Ground
+EN       - Chip enable / reset control
+BOOT     - Boot mode / enable flashing (pull-down to enter download mode)
+SVP      - VP, ADC channel 0, touch sensor T0
+SVN      - VN, ADC channel 3, touch sensor T1
+
+Recommended UART / Programming pins:
+TXD0     - UART0 TX, serial output for programming/logging
+RXD0     - UART0 RX, serial input for programming
+
+Flash and SPI / Boot pins:
+GPIO6    - SD_CLK, SPI SD card / flash clock (internal flash)
+GPIO7    - SD_DATA0, SPI SD card / flash data 0 (internal flash)
+GPIO8    - SD_DATA1, SPI SD card / flash data 1 (internal flash)
+GPIO9    - SD_DATA2, SPI SD card / flash data 2 (internal flash)
+GPIO10   - SD_DATA3, SPI SD card / flash data 3 (internal flash)
+GPIO11   - SD_CMD, SPI SD card / flash command (internal flash)
+GPIO12   - MTDI, HSPI / touch / ADC / VDD_SDIO select
+GPIO13   - MTCK, HSPI SCLK / PWM / ADC / touch
+GPIO14   - MTMS, HSPI SDI / PWM / ADC / touch
+GPIO15   - MTDO, HSPI CS / PWM / ADC / touch
+
+Dedicated Input-only Pins:
+GPIO34   - ADC1_CH6, input only
+GPIO35   - ADC1_CH7, input only
+GPIO36   - ADC1_CH0, SENSOR_VP, input only
+GPIO39   - ADC1_CH3, SENSOR_VN, input only
+
+General Purpose GPIOs (common functions):
+GPIO0    - Boot mode select, ADC2_CH1, touch T0, can be used for general I/O with caution
+GPIO1    - U0TXD, serial TX0, also used for logging
+GPIO2    - U0RXD? no, actually GPIO2 is used as TX2? In devkit, GPIO2 often LED2, PWM, ADC, touch T2
+GPIO3    - U0RXD, serial RX0, also can be used for UART and debug
+GPIO4    - GPIO4, SPI0 / I2C SDA / PWM / ADC2_CH0
+GPIO5    - GPIO5, SPI0 / I2C SCL / PWM / ADC2_CH1
+GPIO16   - UART2 RX / PWM / ADC2_CH0
+GPIO17   - UART2 TX / PWM / ADC2_CH1
+GPIO18   - SPI CLK / PWM / ADC2_CH2
+GPIO19   - SPI MISO / PWM / ADC2_CH3
+GPIO21   - I2C SDA / PWM / ADC2_CH9
+GPIO22   - I2C SCL / PWM / ADC2_CH8
+GPIO23   - SPI MOSI / PWM / ADC2_CH7
+GPIO25   - DAC1 / ADC2_CH8 / PWM
+GPIO26   - DAC2 / ADC2_CH9 / PWM
+GPIO27   - ADC2_CH7 / touch T7 / PWM
+GPIO32   - ADC1_CH4 / touch T4 / PWM
+GPIO33   - ADC1_CH5 / touch T5 / PWM
+GPIO0-39  - Most are multiplexed with ADC/DAC/Touch/PWM/SPI/UART/I2C functions; check specific function conflicts before use.
+
+Touch-capable Pins:
+GPIO0    - Touch T0
+GPIO2    - Touch T2
+GPIO4    - Touch T4
+GPIO12   - Touch T5
+GPIO13   - Touch T4? (varies by module)
+GPIO14   - Touch T6
+GPIO15   - Touch T3
+GPIO27   - Touch T7
+GPIO32   - Touch T9
+GPIO33   - Touch T8
+GPIO34   - not touch
+GPIO35   - not touch
+GPIO36   - not touch
+GPIO39   - not touch
+
+DAC pins:
+GPIO25   - DAC channel 1
+GPIO26   - DAC channel 2
+
+JTAG Pins (common on DevKit):
+GPIO12   - MTDI / JTAG TDI
+GPIO13   - MTCK / JTAG TCK
+GPIO14   - MTMS / JTAG TMS
+GPIO15   - MTDO / JTAG TDO
+
+Notes:
+- GPIO6..GPIO11 are used internally for the flash/SPI interface and should not be used for general I/O on most DevKit boards.
+- GPIO34..GPIO39 are input-only and do not support output or internal pull-ups.
+- GPIO0, GPIO2, GPIO12, GPIO15 have special boot-mode functions; avoid using them when reliable booting is required.
+- For UART0 serial logging and programming, use TXD0(GPIO1) and RXD0(GPIO3).
+
+This file summarizes the ESP32 DEVKIT pin mapping in a simple text format.
