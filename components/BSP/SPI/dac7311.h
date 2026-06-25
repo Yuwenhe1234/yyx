@@ -3,71 +3,85 @@
 
 #include "driver/spi_master.h"
 
-#define DAC7311_SPI_HOST        SPI2_HOST
-#define DAC7311_SCLK_GPIO       18
-#define DAC7311_MOSI_GPIO       23
-#define DAC7311_MISO_GPIO       19
-#define DAC7311_CS_GPIO         5
-#define DAC7311_SPI_FREQ        1000000  // 1 MHz (up to 50 MHz supported)
+/* ============================================================
+ * SPI 硬件引脚定义
+ * ============================================================
+ * ESP32 通过 SPI2（HSPI 外设）与 DAC7311 通信，接线如下：
+ *
+ *   ESP32              DAC7311（8脚封装）
+ *   GPIO18 SCLK  ────→ 5脚 SCLK   串行时钟，ESP32 发出
+ *   GPIO23 MOSI  ────→ 6脚 DIN    串行数据，ESP32 → DAC7311
+ *   GPIO5  CS    ────→ 4脚 SYNC   片选信号，低电平表示"开始通信"
+ *   GPIO19 MISO  ────→ 无连接     DAC7311 只有输出没有输入，不接
+ *
+ * DAC7311 是纯写入设备，不返回任何数据给 ESP32。
+ * ============================================================ */
+#define DAC7311_SPI_HOST        SPI2_HOST       // ESP32 第2个 SPI 外设（HSPI）
+#define DAC7311_SCLK_GPIO       18              // 时钟线
+#define DAC7311_MOSI_GPIO       23              // 主机→从机 数据线
+#define DAC7311_MISO_GPIO       19              // 从机→主机（不用也得配，随便给个 GPIO）
+#define DAC7311_CS_GPIO         5               // 片选线（DAC7311 叫 SYNC，低电平选中）
+#define DAC7311_SPI_FREQ        1000000         // 时钟频率 1 MHz（DAC7311 最高 50 MHz）
 
-// DAC7311 is a 12-bit DAC with SPI interface
-#define DAC7311_RESOLUTION_BITS 12
-#define DAC7311_MAX_VALUE       ((1 << DAC7311_RESOLUTION_BITS) - 1)  // 4095
+/* ============================================================
+ * DAC7311 芯片参数
+ * ============================================================
+ * 德州仪器 TI 公司产 12 位电压输出型 DAC，8 脚封装。
+ * 输出公式：Vout = 2 × VREF × (CODE / 4096)
+ *   VREF：外部参考电压（第3脚输入，≤ VDD/2）
+ *   CODE：12 位编码（0~4095）
+ * 例：VREF=2.5V, CODE=2048 → Vout = 2×2.5×(2048/4096) = 2.5V
+ * ============================================================ */
+#define DAC7311_RESOLUTION_BITS 12              // 分辨率 12 位
+#define DAC7311_MAX_VALUE       ((1 << DAC7311_RESOLUTION_BITS) - 1)  // 最大值 = 4095
 
-// DAC7311 Serial Data Format:
-// Format: 16 bits
-// Bits [15:14]: Power control (00 = Normal operation, 10 = Power down)
-// Bits [13:12]: Don't care
-// Bits [11:0]: 12-bit DAC data
+/* ============================================================
+ * 串行数据帧格式（固定 16 位，高位先发）
+ * ============================================================
+ *
+ *   ┌───────┬───────┬───────┬───────┬──────────────────────┐
+ *   │ DB15  │ DB14  │ DB13  │ DB12  │  DB11 ········· DB0  │
+ *   ├───────┼───────┼───────┼───────┼──────────────────────┤
+ *   │  PD1  │  PD0  │   X   │   X   │   12 位 DAC 数据     │
+ *   └───────┴───────┴───────┴───────┴──────────────────────┘
+ *   高位 ←────────────────────────────────────────────→ 低位
+ *   先发                                               后发
+ *
+ * PD1,PD0 — 掉电模式控制位（数据手册 Table 1）：
+ *   0 0 = 正常模式，输出电压由 DAC 数据决定
+ *   0 1 = 输出经 1kΩ 电阻接地
+ *   1 0 = 输出经 100kΩ 电阻接地
+ *   1 1 = 高阻态，输出断开
+ *
+ * DB13,DB12 — 无关位，写 0 写 1 都不影响输出
+ * DB11~DB0 — DAC 数据，DB11=最高位, DB0=最低位
+ *
+ * 例：VREF=2.5V，要输出 1.25V
+ *   CODE = 1.25 / (2×2.5) × 4096 = 1024 = 0x400
+ *   发送帧 = 0x0400（PD=00, 无关=00, DATA=1024）
+ * ============================================================ */
 
-#define DAC7311_CMD_NORMAL      0x00
-#define DAC7311_CMD_POWERDOWN   0x02
+#define DAC7311_CMD_NORMAL      0x00            // PD1=0, PD0=0 → 正常工作
+#define DAC7311_CMD_POWERDOWN   0x02            // PD1=1, PD0=0 → 100kΩ 到地
 
+/* ============================================================
+ * 设备句柄 — 封装 ESP-IDF 的 SPI 设备句柄
+ * ============================================================ */
 typedef struct {
-    spi_device_handle_t spi_handle;
+    spi_device_handle_t spi_handle;             // SPI 设备句柄，传给 spi_device_transmit 等 API
 } dac7311_handle_t;
 
-/**
- * Initialize DAC7311 SPI DAC
- * @return handle to DAC7311 device, NULL if failed
- */
-dac7311_handle_t* dac7311_init(void);
+/* ---- 生命周期 ---- */
+dac7311_handle_t* dac7311_init(void);           // 初始化 SPI 总线 + 挂载 DAC7311，返回句柄
+void dac7311_deinit(dac7311_handle_t* handle);  // 移除设备 + 释放总线 + 释放句柄
 
-/**
- * Deinitialize DAC7311
- * @param handle Device handle
- */
-void dac7311_deinit(dac7311_handle_t* handle);
+/* ---- 核心写入 ---- */
+int dac7311_write(dac7311_handle_t* handle, uint16_t value);          // 写 12 位原始值（0~4095）
+int dac7311_write_voltage(dac7311_handle_t* handle,                   // 按电压写入
+                          uint16_t voltage_mv, uint16_t vref_mv);      // 目标电压(mV)，参考电压(mV)
 
-/**
- * Write 12-bit value to DAC7311
- * @param handle Device handle
- * @param value 12-bit DAC value (0-4095)
- * @return ESP_OK on success, error code otherwise
- */
-int dac7311_write(dac7311_handle_t* handle, uint16_t value);
-
-/**
- * Write voltage to DAC7311
- * @param handle Device handle
- * @param voltage_mv Output voltage in millivolts
- * @param vref_mv Reference voltage in millivolts (e.g., 5000 for 5V ref)
- * @return ESP_OK on success, error code otherwise
- */
-int dac7311_write_voltage(dac7311_handle_t* handle, uint16_t voltage_mv, uint16_t vref_mv);
-
-/**
- * Power down DAC7311
- * @param handle Device handle
- * @return ESP_OK on success, error code otherwise
- */
-int dac7311_power_down(dac7311_handle_t* handle);
-
-/**
- * Power up DAC7311 (normal operation)
- * @param handle Device handle
- * @return ESP_OK on success, error code otherwise
- */
-int dac7311_power_up(dac7311_handle_t* handle);
+/* ---- 电源控制 ---- */
+int dac7311_power_down(dac7311_handle_t* handle);  // 进入掉电：输出接 100kΩ 到地
+int dac7311_power_up(dac7311_handle_t* handle);    // 退出掉电：正常模式，输出 0V
 
 #endif /* __DAC7311_H__ */

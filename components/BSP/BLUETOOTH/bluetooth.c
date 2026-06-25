@@ -1,6 +1,7 @@
 #include "bluetooth.h"
 
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 
 #include "esp_log.h"

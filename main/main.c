@@ -2,6 +2,7 @@
  * 模块1：头文件 — 引入所有依赖的库和驱动
  * ============================================================ */
 #include <stdio.h>                          // 标准输入输出，提供 printf() 串口打印
+#include <strings.h>                         // 提供 strcasecmp() 字符串比较
 #include "led.h"                            // LED 驱动，控制板载 LED (GPIO2)
 #include "key.h"                            // 按键驱动，检测 BOOT 按钮 (GPIO0)
 #include "bluetooth.h"                      // 蓝牙 BLE 驱动，手机无线通信
@@ -97,12 +98,11 @@ void app_main(void)
             int16_t voltage_mv;             // 存放转换后的电压值（单位：毫伏，可为负值）
 
             if (ads1013_read_raw(adc, &raw_value) == 0) { // I2C 读取转换寄存器，返回 0 表示成功
-                if (ads1013_read_voltage(adc, &voltage_mv, 2048) == 0) { // 将原始值转为毫伏（PGA=±2.048V）
-                    sensor.adc_raw = raw_value;         // 填入传感器结构体：原始值
-                    sensor.adc_voltage_mv = voltage_mv; // 填入传感器结构体：电压值
-                    sensor.adc_valid = true;            // 标记 ADC 数据有效
-                    ESP_LOGI(TAG, "ADS1013 - Raw: %d, Voltage: %d mV", raw_value, voltage_mv); // 串口输出
-                }
+                voltage_mv = ads1013_raw_to_voltage_mv(raw_value, 4096); // 纯计算：raw → mV（PGA=±4.096V）
+                sensor.adc_raw = raw_value;         // 填入传感器结构体：原始值
+                sensor.adc_voltage_mv = voltage_mv; // 填入传感器结构体：电压值
+                sensor.adc_valid = true;            // 标记 ADC 数据有效
+                ESP_LOGI(TAG, "ADS1013 - Raw: %d, Voltage: %d mV", raw_value, voltage_mv); // 串口输出
             }
         }
 
