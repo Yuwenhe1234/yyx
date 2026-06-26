@@ -20,29 +20,47 @@ static const char *TAG = "APP_MAIN";        // 所有日志打印时显示 [APP_
 /* ============================================================
  * 模块3：BLE 命令回调 — 手机发送 DC/SINE/PLU 命令时被蓝牙模块调用
  * ============================================================ */
-static void ble_command_handler(const char *cmd, void *ctx)  // cmd: 手机发来的文本命令，ctx: DAC7311 句柄
+static void ble_command_handler(const char *cmd, void *ctx)  // cmd: 手机发来的文本命令，ctx: DAC 句柄
 {
-    dac7311_handle_t *dac = (dac7311_handle_t *)ctx;         // 从上下文取出 DAC7311 句柄
+    dac7311_handle_t *dac = (dac7311_handle_t *)ctx;
+    char ack[64];
 
+    // ---- 直流模式：DC0~DC2.0（V）----
     float dc_voltage;
-    if (sscanf(cmd, "DC%f", &dc_voltage) == 1) {            // 解析 "DC1.5" 格式的电压设置命令
-        if (dc_voltage < 0 || dc_voltage > 5.0f) {           // DAC7311 支持 0~5V（取决于 VREF）
-            ESP_LOGW(TAG, "DC voltage %.2fV out of range", dc_voltage); // 超出范围警告
+    if (sscanf(cmd, "DC%f", &dc_voltage) == 1) {
+        if (dc_voltage < 0.0f || dc_voltage > 2.0f) {
+            bluetooth_notify_text("ERR: DC 0-2V only");
             return;
         }
-        uint16_t mv = (uint16_t)(dc_voltage * 1000.0f);      // 电压转为毫伏
-        dac7311_write_voltage(dac, mv, 5000);                // 写 DAC7311（参考电压 5000mV）
-        ESP_LOGI(TAG, "BLE cmd: DC%.2fV → DAC7311 %u mV", dc_voltage, mv);
+        uint16_t mv = (uint16_t)(dc_voltage * 1000.0f);
+        dac7311_set_dc(dac, mv);
+        snprintf(ack, sizeof(ack), "ACK DC %.2fV", dc_voltage);
+        bluetooth_notify_text(ack);
+        // 推送 DAC 状态给 BLE 流
+        sensor_data_t s = { .dac_value = (uint16_t)(mv * 4096UL / DAC_VREF_MV),
+                            .dac_mode = 0, .dac_param = mv, .dac_valid = true };
+        bluetooth_send_sensor_data(&s);
+        ESP_LOGI(TAG, "BLE: DC %.2fV", dc_voltage);
         return;
     }
 
-    if (strcasecmp(cmd, "SINE") == 0) {                      // 手机发送 "SINE" 命令
-        ESP_LOGW(TAG, "SINE waveform not yet implemented on external DAC");
+    // ---- 正弦模式：40Hz 2Vpp ----
+    if (strcasecmp(cmd, "SINE") == 0) {
+        dac7311_start_sine(dac, 40, 2000);
+        bluetooth_notify_text("ACK SINE 40Hz 2Vpp");
+        sensor_data_t s = { .dac_mode = 1, .dac_param = 2000, .dac_valid = true };
+        bluetooth_send_sensor_data(&s);
+        ESP_LOGI(TAG, "BLE: SINE 40Hz 2Vpp");
         return;
     }
 
-    if (strcasecmp(cmd, "PLU") == 0) {                       // 手机发送 "PLU" 命令
-        ESP_LOGW(TAG, "PULSE waveform not yet implemented on external DAC");
+    // ---- 脉冲模式：40Hz 50% 占空比 2Vpp ----
+    if (strcasecmp(cmd, "PLU") == 0) {
+        dac7311_start_pulse(dac, 40, 2000);
+        bluetooth_notify_text("ACK PLU 40Hz 2Vpp");
+        sensor_data_t s = { .dac_mode = 2, .dac_param = 2000, .dac_valid = true };
+        bluetooth_send_sensor_data(&s);
+        ESP_LOGI(TAG, "BLE: PULSE 40Hz 2Vpp");
         return;
     }
 }
@@ -75,12 +93,12 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to initialize DAC7311");   // 打印错误日志
     } else {                                // 初始化成功
         ESP_LOGI(TAG, "DAC7311 initialized successfully"); // 打印成功日志
-        bluetooth_register_command_callback(ble_command_handler, dac); // 注册 BLE 命令回调：手机发 DC/SINE/PLU 时操作 DAC7311
+        bluetooth_register_command_callback(ble_command_handler, dac); // 注册 BLE 命令回调
+        dac7311_set_dc(dac, 0);             // 默认直流模式 0V，手机发 DC/SINE/PLU 切换
     }
 
     /* ---------- 模块8：主循环专用计数器 ---------- */
     uint16_t adc_count = 0;                 // ADC 读取节奏计数器：每 5 次循环 (=500ms) 触发一次 ADC 读取
-    uint16_t dac_count = 0;                 // DAC 波形步进计数器：每次循环 +1，用于生成锯齿波
 
     /* ---------- 模块9：主循环（无限循环，永不退出）---------- */
     while(1){
@@ -106,21 +124,8 @@ void app_main(void)
             }
         }
 
-        /* --- 子模块9.3：SPI 写入外部 DAC（每 100ms 一次，生成锯齿波）--- */
-        if (dac) {                          // dac 非 NULL（初始化成功）才执行
-            uint16_t dac_value = (dac_count * 64) & 0xFFF; // 锯齿波算法：dac_count×64 取低12位，0→64→128→…→4095→0→循环
-            if (dac7311_write(dac, dac_value) == 0) { // SPI 发送 16 位数据到 DAC7311，返回 0 表示成功
-                sensor.dac_value = dac_value;   // 填入传感器结构体：DAC 值
-                sensor.dac_valid = true;        // 标记 DAC 数据有效
-                if (dac_count % 10 == 0) {  // 每 10 次（=每 1 秒）打印一次，避免串口刷屏
-                    ESP_LOGI(TAG, "DAC7311 - Value: %d", dac_value); // 串口输出当前 DAC 值
-                }
-            }
-            dac_count++;                    // DAC 步进计数器 +1，驱动锯齿波前进
-        }
-
-        /* --- 子模块9.4：推送传感器数据到蓝牙模块 --- */
-        if (sensor.adc_valid || sensor.dac_valid) { // 只要有新数据就推送
+        /* --- 子模块9.3：推送传感器数据到蓝牙模块 --- */
+        if (sensor.adc_valid) {                     // 有 ADC 新数据就推送
             bluetooth_send_sensor_data(&sensor);    // 写入蓝牙缓存，由 streaming_task 通过 BLE 通知手机
         }
 

@@ -49,6 +49,13 @@ void bluetooth_register_command_callback(bluetooth_command_cb_t cb, void *user_c
     (void)user_ctx;
 }
 
+// 公开通知 - 桩函数版本
+esp_err_t bluetooth_notify_text(const char *text)
+{
+    (void)text;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
 #else
 
 #include "nvs_flash.h"
@@ -107,6 +114,12 @@ static esp_err_t notify_text(const char *s)
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+// 公开通知接口 — 供 main.c 等外部模块调用来发送 ACK / 状态更新
+esp_err_t bluetooth_notify_text(const char *text)
+{
+    return notify_text(text);
 }
 
 // 设置流媒体状态函数
@@ -337,12 +350,15 @@ static void streaming_task(void *param)
     while (1) {
         if (g_notify_enabled && g_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
             if (g_latest_sensor_data.adc_valid || g_latest_sensor_data.dac_valid) {
-                char buf[128];
+                char buf[192];
+                const char *mode_str[] = {"DC", "SINE", "PULSE"};
                 int len = snprintf(buf, sizeof(buf),
-                    "SENSOR ADC_RAW=%u ADC_MV=%d DAC=%u",
+                    "SENSOR ADC_RAW=%u ADC_MV=%d DAC=%u MODE=%s PARAM=%u",
                     g_latest_sensor_data.adc_raw,
                     g_latest_sensor_data.adc_voltage_mv,
-                    g_latest_sensor_data.dac_value);
+                    g_latest_sensor_data.dac_value,
+                    mode_str[g_latest_sensor_data.dac_mode % 3],
+                    g_latest_sensor_data.dac_param);
                 if (len > 0 && len < (int)sizeof(buf)) {
                     struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, len);
                     if (om) {
