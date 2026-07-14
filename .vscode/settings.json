@@ -8,11 +8,12 @@
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32"
   },
-  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
+  "idf.toolsPath": "D:\\Espressif\\tools",
+  "clangd.path": "D:\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=d:\\software\\esp-idf\\project\\DAC\\build"
+    "--compile-commands-dir=d:\\software\\esp-idf\\project\\esp32\\stimulate\\build"
   ],
   "idf.flashType": "UART"
 }
