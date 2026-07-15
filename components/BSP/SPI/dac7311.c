@@ -3,74 +3,97 @@
  * DAC 驱动 — 12 位 SPI DAC（DAC7311/DAC7571 系列）
  * ============================================================
  *
- * 【架构】Core 1 独占 high-priority 任务，esp_timer_get_time() 定时，
- *   spi_device_polling_transmit 直写 SPI 寄存器。
- *   零 ISR、零中断、零信号量 → 完全不干扰 Core 0 上的 BLE。
- *
- *   精度：1µs 定时分辨率（用硬件 cycle counter 换算微秒）。
- *   任务优先级 configMAX_PRIORITIES 确保不被任何其他任务打断。
+ * 【架构】成熟方案：Core 1 GPTimer ISR 直接 polling SPI
+ *   - GPTimer 由 Core 1 任务创建/注册回调 → ISR 自动绑定 Core 1
+ *   - ISR 内直接 spi_device_polling_transmit（IDF 官方 API 允许，有 SPI_MASTER_ISR_ATTR 标记）
+ *   - Core 0 完全不受影响 → BLE 100% 稳定
  *
  * 【SPI】16 位帧，MSB 先发，SPI Mode 0，10 MHz。
  */
 #include "dac7311.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "driver/gptimer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_timer.h"
 #include <math.h>
 #include <stdlib.h>
 
 static const char *TAG = "DAC7311";
 static void build_sine_lut(dac7311_handle_t* handle, uint16_t amplitude_mv);
 
-/* ---- 波形生成任务：Core 1 独占，esp_timer_get_time() 精准定时 + polling SPI ---- */
-static void IRAM_ATTR waveform_task(void *arg)
+/* ---- GPTimer ISR：跑在 Core 1，直接 polling SPI（不占用 Core 0 中断）---- */
+static bool IRAM_ATTR waveform_timer_isr(gptimer_handle_t timer,
+    const gptimer_alarm_event_data_t *edata, void *arg)
 {
     dac7311_handle_t *h = (dac7311_handle_t *)arg;
-    int64_t next_tick_us = 0;
-    int64_t period_us = 0;
+
+    switch (h->waveform_mode) {
+    case DAC7311_MODE_SINE: {
+        spi_transaction_t t = { .length = 16, .tx_buffer = h->sine_lut[h->sine_phase] };
+        spi_device_polling_transmit(h->spi_handle, &t);
+        h->sine_phase = (h->sine_phase + 1) % DAC7311_SINE_LUT_SIZE;
+        break;
+    }
+    case DAC7311_MODE_PULSE: {
+        uint16_t code = h->pulse_state ? h->pulse_high_code : h->pulse_low_code;
+        uint16_t tx = (DAC7311_CMD_NORMAL << 14) | ((code & 0xFFF) << 2);
+        spi_transaction_t t = { .flags = SPI_TRANS_USE_TXDATA, .length = 16 };
+        t.tx_data[0] = (tx >> 8) & 0xFF;
+        t.tx_data[1] = tx & 0xFF;
+        spi_device_polling_transmit(h->spi_handle, &t);
+        h->pulse_state = !h->pulse_state;
+        break;
+    }
+    default:
+        break;
+    }
+    return false; // 不需要 yield
+}
+
+/* ---- 波形管理任务：跑在 Core 1，负责创建 GPTimer（ISR 自动绑定 Core 1）---- */
+static void waveform_mgr_task(void *arg)
+{
+    dac7311_handle_t *h = (dac7311_handle_t *)arg;
 
     while (1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        // 等待命令
+        ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
 
-        period_us = h->waveform_period_us;
-        next_tick_us = esp_timer_get_time();
+        if (h->waveform_mode == DAC7311_MODE_NONE) continue;
 
+        uint64_t period_us = h->waveform_period_us;
+
+        // ★ 在 Core 1 上创建 GPTimer → ISR 自动分配在 Core 1
+        gptimer_config_t cfg = { .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+                                 .direction = GPTIMER_COUNT_UP, .resolution_hz = 1000000 };
+        if (gptimer_new_timer(&cfg, &h->waveform_timer) != ESP_OK) {
+            ESP_LOGE(TAG, "GPTimer create fail");
+            continue;
+        }
+
+        gptimer_alarm_config_t a = { .alarm_count = period_us, .reload_count = 0,
+                                     .flags.auto_reload_on_alarm = true };
+        gptimer_set_alarm_action(h->waveform_timer, &a);
+        gptimer_event_callbacks_t cb = { .on_alarm = waveform_timer_isr };
+        gptimer_register_event_callbacks(h->waveform_timer, &cb, h);
+        gptimer_enable(h->waveform_timer);
+        gptimer_start(h->waveform_timer);
+
+        ESP_LOGI(TAG, "Waveform running (Core 1 ISR, %llu us)", period_us);
+
+        // 阻塞直到收到 stop 或 mode 变化通知
         while (h->waveform_mode != DAC7311_MODE_NONE) {
-            next_tick_us += period_us;
+            uint32_t ret = ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(100));
+            if (ret > 0) break; // 收到新命令 → 重新配置
+        }
 
-            switch (h->waveform_mode) {
-            case DAC7311_MODE_SINE: {
-                spi_transaction_t t = { .length = 16, .tx_buffer = h->sine_lut[h->sine_phase] };
-                spi_device_polling_transmit(h->spi_handle, &t);
-                h->sine_phase = (h->sine_phase + 1) % DAC7311_SINE_LUT_SIZE;
-                break;
-            }
-            case DAC7311_MODE_PULSE: {
-                uint16_t code = h->pulse_state ? h->pulse_high_code : h->pulse_low_code;
-                uint16_t tx = (DAC7311_CMD_NORMAL << 14) | ((code & 0xFFF) << 2);
-                spi_transaction_t t = { .flags = SPI_TRANS_USE_TXDATA, .length = 16 };
-                t.tx_data[0] = (tx >> 8) & 0xFF;
-                t.tx_data[1] = tx & 0xFF;
-                spi_device_polling_transmit(h->spi_handle, &t);
-                h->pulse_state = !h->pulse_state;
-                break;
-            }
-            default:
-                break;
-            }
-
-            // 精准忙等直到下一个采样点
-            int64_t now;
-            while ((now = esp_timer_get_time()) < next_tick_us) {
-                // busy-wait on Core 1: 不打扰 Core 0 的 BLE
-                if (next_tick_us - now > 50) {
-                    // 如果还差很多时间（>50µs），释放 CPU 一小段时间
-                    // 但 Core 1 上没有别的任务需要 CPU，所以直接用 NOP 忙等也可以
-                    // 用 taskYIELD 反而可能让调度器空闲 → 短暂睡眠
-                }
-            }
+        // 停止定时器
+        if (h->waveform_timer) {
+            gptimer_stop(h->waveform_timer);
+            gptimer_disable(h->waveform_timer);
+            gptimer_del_timer(h->waveform_timer);
+            h->waveform_timer = NULL;
         }
     }
     vTaskDelete(NULL);
@@ -99,9 +122,9 @@ dac7311_handle_t* dac7311_init(void)
     ret = spi_bus_add_device(DAC7311_SPI_HOST, &dev, &handle->spi_handle);
     if (ret != ESP_OK) { ESP_LOGE(TAG, "SPI dev fail"); spi_bus_free(DAC7311_SPI_HOST); free(handle); return NULL; }
 
-    // 创建 Core 1 独占任务：最高优先级
-    BaseType_t created = xTaskCreatePinnedToCore(waveform_task, "dac_wave", 2048, handle,
-                                     configMAX_PRIORITIES, &handle->waveform_task, 1);
+    // ★ Core 1 上创建管理任务（GPTimer 也在 Core 1 上创建 → ISR 绑定 Core 1）
+    BaseType_t created = xTaskCreatePinnedToCore(waveform_mgr_task, "dac_mgr", 2048, handle,
+                                     5, &handle->waveform_task, 1);
     if (created != pdPASS) {
         ESP_LOGE(TAG, "Task create fail");
         spi_bus_free(DAC7311_SPI_HOST);
@@ -109,13 +132,11 @@ dac7311_handle_t* dac7311_init(void)
         return NULL;
     }
 
-    vTaskSuspend(handle->waveform_task); // 初始暂停，等 start_sine/start_pulse 唤醒
-
     // 预建 2000mVpp LUT
     build_sine_lut(handle, 2000);
 
     dac7311_write(handle, 0);
-    ESP_LOGI(TAG, "DAC ready (SPI2 10MHz, Core1 no ISR)");
+    ESP_LOGI(TAG, "DAC ready (SPI2 10MHz, Core1 GPTimer ISR)");
     return handle;
 }
 
@@ -123,6 +144,10 @@ void dac7311_deinit(dac7311_handle_t* handle)
 {
     if (!handle) return;
     dac7311_stop_waveform(handle);
+    if (handle->waveform_task) {
+        vTaskDelete(handle->waveform_task);
+        handle->waveform_task = NULL;
+    }
     spi_bus_remove_device(handle->spi_handle);
     spi_bus_free(DAC7311_SPI_HOST);
     free(handle);
@@ -180,13 +205,12 @@ static void build_sine_lut(dac7311_handle_t* handle, uint16_t amplitude_mv)
     handle->sine_amplitude_mv = amplitude_mv;
 }
 
-/* ---- start_sine：O(1)，通知 Core 1 任务开始 + 唤醒任务 ---- */
+/* ---- start_sine ---- */
 int dac7311_start_sine(dac7311_handle_t* handle, uint16_t freq_hz, uint16_t amplitude_mv)
 {
     if (!handle) return ESP_ERR_INVALID_ARG;
     dac7311_stop_waveform(handle);
 
-    // 振幅变化才重建 LUT
     if (handle->sine_amplitude_mv != amplitude_mv)
         build_sine_lut(handle, amplitude_mv);
 
@@ -195,10 +219,11 @@ int dac7311_start_sine(dac7311_handle_t* handle, uint16_t freq_hz, uint16_t ampl
     handle->waveform_period_us = 1000000ULL / ((uint32_t)freq_hz * DAC7311_SINE_LUT_SIZE);
     handle->waveform_mode = DAC7311_MODE_SINE;
 
-    xTaskNotifyGive(handle->waveform_task); // 唤醒 Core 1 任务
+    xTaskNotifyGive(handle->waveform_task); // 通知 Core 1 管理任务
     return ESP_OK;
 }
 
+/* ---- start_pulse ---- */
 int dac7311_start_pulse(dac7311_handle_t* handle, uint16_t freq_hz, uint16_t amplitude_mv)
 {
     if (!handle) return ESP_ERR_INVALID_ARG;
@@ -214,12 +239,16 @@ int dac7311_start_pulse(dac7311_handle_t* handle, uint16_t freq_hz, uint16_t amp
     return ESP_OK;
 }
 
+/* ---- stop_waveform ---- */
 int dac7311_stop_waveform(dac7311_handle_t* handle)
 {
     if (!handle) return ESP_ERR_INVALID_ARG;
     if (handle->waveform_mode == DAC7311_MODE_NONE) return ESP_OK;
+
+    // 告知管理任务停止
     handle->waveform_mode = DAC7311_MODE_NONE;
-    // 任务内循环检测到 MODE_NONE 后会阻塞在 ulTaskNotifyTake
+    // 管理任务在 100ms 超时内会检测到 MODE_NONE 并停定时器
+    xTaskNotifyGive(handle->waveform_task);
     return ESP_OK;
 }
 

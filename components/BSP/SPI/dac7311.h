@@ -2,6 +2,7 @@
 #define __DAC7311_H__
 
 #include "driver/spi_master.h"
+#include "driver/gptimer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -37,14 +38,15 @@ typedef enum {
 #define DAC7311_SINE_LUT_SIZE   512
 
 /* ============================================================
- * 设备句柄 — Core 1 任务 + polling SPI，零 ISR 架构
+ * 设备句柄 — Core 1 GPTimer ISR 直发 SPI
  * ============================================================ */
 typedef struct {
     spi_device_handle_t spi_handle;
 
     dac7311_waveform_mode_t waveform_mode;
-    uint64_t waveform_period_us;                // 微秒采样间隔
-    TaskHandle_t waveform_task;                 // Core 1 独占任务
+    uint64_t waveform_period_us;
+    gptimer_handle_t waveform_timer;
+    TaskHandle_t waveform_task;                 // Core 1 管理任务
 
     uint8_t sine_lut[DAC7311_SINE_LUT_SIZE][2];
     uint16_t sine_phase;
