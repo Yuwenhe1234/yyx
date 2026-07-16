@@ -190,48 +190,30 @@ static void ble_app_advertise(void)
     ble_gap_adv_start(g_own_addr_type, NULL, BLE_HS_FOREVER, &ap, ble_gap_event, NULL);
 }
 
-/* ── streaming_task: 紧凑二进制帧, 每 25ms 批量推送 ≤20 采样点 ── */
+/* ── streaming_task: 文本格式批量推送, 每 25ms 发送 ≤20 采样点 ── */
 #define MAX_SPF 20
 static void streaming_task(void *param)
 {
     (void)param;
     while (1) {
         if (g_notify_enabled && g_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-            uint8_t cnt = 0;
-            uint16_t raws[MAX_SPF];
-            int16_t mvs[MAX_SPF];
-
-            while (cnt < MAX_SPF && g_adc_ring.count > 0) {
-                raws[cnt] = g_adc_ring.raw[g_adc_ring.tail];
-                mvs[cnt]  = g_adc_ring.voltage_mv[g_adc_ring.tail];
+            // 每次只发一个采样点: "ADC:raw,mv"
+            if (g_adc_ring.count > 0) {
+                uint16_t r = g_adc_ring.raw[g_adc_ring.tail];
+                int16_t  v = g_adc_ring.voltage_mv[g_adc_ring.tail];
                 g_adc_ring.tail = (g_adc_ring.tail + 1) % ADC_RING_SIZE;
                 g_adc_ring.count--;
-                cnt++;
-            }
 
-            uint8_t pkt[256];
-            uint16_t *h = (uint16_t *)pkt;
-            h[0] = cnt;
-            h[1] = g_latest_sensor_data.dac_mode;
-            h[2] = g_latest_sensor_data.dac_param;
-            h[3] = g_latest_sensor_data.dac_value;
-
-            for (int i = 0; i < cnt; i++) {
-                uint8_t *sp = &pkt[8 + i * 4];
-                sp[0] = (uint8_t)(raws[i] & 0xFF);
-                sp[1] = (uint8_t)((raws[i] >> 8) & 0xFF);
-                sp[2] = (uint8_t)(mvs[i] & 0xFF);
-                sp[3] = (uint8_t)((mvs[i] >> 8) & 0xFF);
-            }
-
-            int total = 8 + cnt * 4;
-            struct os_mbuf *om = ble_hs_mbuf_from_flat(pkt, total);
-            if (om) {
-                int rc = ble_gatts_notify_custom(g_conn_handle, g_tx_val_handle, om);
-                if (rc) ESP_LOGW(TAG, "notify rc=%d", rc);
+                char buf[40];
+                int len = snprintf(buf, sizeof(buf), "ADC:%u,%d", r, v);
+                struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, len);
+                if (om) {
+                    int rc = ble_gatts_notify_custom(g_conn_handle, g_tx_val_handle, om);
+                    if (rc) ESP_LOGW(TAG, "notify rc=%d", rc);
+                }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(25));
+        vTaskDelay(pdMS_TO_TICKS(1)); // 1 tick = 10ms → 100 SPS
     }
 }
 
