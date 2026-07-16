@@ -1,130 +1,122 @@
 /* ============================================================
- * 模块1：头文件 — 引入所有依赖的库和驱动
+ * main.c — BLE 无线刺激器主控
+ * ADC: esp_timer 1250us ISR → Semaphore → 高优Task I2C = 800Hz
+ * BLE: streaming_task 25ms → 紧凑二进制帧 (≤20采样点/帧)
+ * 串口: 每 10ms 打印 ADC 数据到 ESP-IDF 监视器
  * ============================================================ */
-#include <stdio.h>                          // 标准输入输出，提供 printf() 串口打印
-#include <string.h>                         // 提供 strncpy 等
-#include <strings.h>                        // 提供 strcasecmp() 字符串比较
-#include "led.h"                            // LED 驱动，控制板载 LED (GPIO2)
-#include "key.h"                            // 按键驱动，检测 BOOT 按钮 (GPIO0)
-#include "bluetooth.h"                      // 蓝牙 BLE 驱动，手机无线通信
-#include "freertos/FreeRTOS.h"              // FreeRTOS 操作系统内核
-#include "freertos/task.h"                  // FreeRTOS 任务管理，提供 vTaskDelay() 延时
-#include "ads1013.h"                        // I2C 外部 ADC 芯片驱动 (ADS1013, 地址 0x48)
-#include "dac7311.h"                        // SPI 外部 DAC 芯片驱动 (DAC7311, 12位)
-#include "esp_log.h"                        // ESP32 日志库，提供 ESP_LOGI/ESP_LOGE 等
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_timer.h"
+#include "led.h"
+#include "key.h"
+#include "bluetooth.h"
+#include "ads1013.h"
+#include "dac7311.h"
+#include "esp_log.h"
 
-/* ============================================================
- * 模块2：日志标签 — 本文件的日志前缀标识
- * ============================================================ */
 static const char *TAG = "APP_MAIN";
+static ads1013_handle_t *g_adc = NULL;
+static dac7311_handle_t *g_dac = NULL;
 
-/* ============================================================
- * 模块3：BLE 命令回调 — 手机发送 DC/SINE/PLU 命令时被蓝牙模块调用
- *         GPTimer ISR 在 Core 1 运行，不干扰 BLE，safe to call directly.
- * ============================================================ */
-static void ble_command_handler(const char *cmd, void *ctx)
+/* ── ADC 高速采样: esp_timer 1250us → Semaphore → Task ── */
+static SemaphoreHandle_t g_sem = NULL;
+static volatile bool g_sem_given = false;
+
+static void adc_timer_cb(void *arg)
+{
+    (void)arg;
+    if (!g_sem_given) {
+        g_sem_given = true;
+        BaseType_t w = pdFALSE;
+        xSemaphoreGiveFromISR(g_sem, &w);
+        if (w) portYIELD_FROM_ISR();
+    }
+}
+
+static void adc_task(void *param)
+{
+    (void)param;
+    while (1) {
+        if (xSemaphoreTake(g_sem, pdMS_TO_TICKS(100)) == pdTRUE) {
+            g_sem_given = false;
+            if (g_adc) {
+                uint16_t r; int16_t v;
+                if (ads1013_read_raw(g_adc, &r) == 0) {
+                    v = ads1013_raw_to_voltage_mv(r, 4096);
+                    bluetooth_push_adc_sample(r, v);
+                    /* ★ 串口输出，可在 idf.py monitor 或 putty/screen 中看到 */
+                    printf("ADC raw=%u mv=%d\n", r, v);
+                }
+            }
+        }
+    }
+}
+
+/* ── BLE 命令回调 ── */
+static void ble_cmd_cb(const char *cmd, void *ctx)
 {
     dac7311_handle_t *dac = (dac7311_handle_t *)ctx;
     char ack[64];
-
-    // ---- 直流模式：DC0~DC2.0（V）----
-    float dc_voltage;
-    if (sscanf(cmd, "DC%f", &dc_voltage) == 1) {
-        if (dc_voltage < 0.0f || dc_voltage > 2.0f) {
-            bluetooth_notify_text("ERR: DC 0-2V only");
-            return;
-        }
-        uint16_t mv = (uint16_t)(dc_voltage * 1000.0f);
+    float v;
+    if (sscanf(cmd, "DC%f", &v) == 1) {
+        if (v < 0.0f || v > 2.0f) { bluetooth_notify_text("ERR: DC 0-2V only"); return; }
+        uint16_t mv = (uint16_t)(v * 1000.0f);
         dac7311_set_dc(dac, mv);
-        snprintf(ack, sizeof(ack), "ACK DC %.2fV", dc_voltage);
+        snprintf(ack, sizeof(ack), "ACK DC %.2fV", v);
         bluetooth_notify_text(ack);
-        ESP_LOGI(TAG, "DAC: DC %.2fV", dc_voltage);
         return;
     }
-
-    // ---- 正弦模式：40Hz 2Vpp ----
-    if (strcasecmp(cmd, "SINE") == 0) {
-        // Core 1 GPTimer ISR 跑 SPI，不干扰 BLE
+    if (!strcasecmp(cmd, "SINE")) {
         dac7311_start_sine(dac, 40, 2000);
         bluetooth_notify_text("ACK SINE 40Hz 2Vpp");
-        ESP_LOGI(TAG, "DAC: SINE 40Hz 2Vpp");
         return;
     }
-
-    // ---- 脉冲模式：40Hz 50% 占空比 2Vpp ----
-    if (strcasecmp(cmd, "PLU") == 0) {
+    if (!strcasecmp(cmd, "PLU")) {
         dac7311_start_pulse(dac, 40, 2000);
         bluetooth_notify_text("ACK PLU 40Hz 2Vpp");
-        ESP_LOGI(TAG, "DAC: PULSE 40Hz 2Vpp");
         return;
     }
-
     bluetooth_notify_text("ERR: Unknown cmd");
 }
 
-/* ============================================================
- * 模块4：程序入口 — 芯片上电后自动调用
- * ============================================================ */
+/* ── 入口 ── */
 void app_main(void)
 {
-    /* ---------- 基础外设初始化 ---------- */
-    led_init();
-    key_init();
-    led_off();
+    led_init(); key_init(); led_off();
     bluetooth_init();
-    printf("Hello world!\n");
+    ESP_LOGI(TAG, "Hello world!");
 
-    /* ---------- I2C 外部 ADC 初始化 ---------- */
-    ESP_LOGI(TAG, "Initializing ADS1013 I2C ADC...");
-    ads1013_handle_t* adc = ads1013_init();
-    if (!adc) {
-        ESP_LOGE(TAG, "Failed to initialize ADS1013");
-    } else {
-        ESP_LOGI(TAG, "ADS1013 initialized successfully");
+    g_adc = ads1013_init();
+    if (!g_adc) ESP_LOGE(TAG, "ADS1013 fail");
+
+    g_dac = dac7311_init();
+    if (!g_dac) { ESP_LOGE(TAG, "DAC7311 fail"); }
+    else {
+        bluetooth_register_command_callback(ble_cmd_cb, g_dac);
+        dac7311_set_dc(g_dac, 0);
     }
 
-    /* ---------- SPI 外部 DAC 初始化 ---------- */
-    ESP_LOGI(TAG, "Initializing DAC7311 SPI DAC...");
-    dac7311_handle_t* dac = dac7311_init();
-    if (!dac) {
-        ESP_LOGE(TAG, "Failed to initialize DAC7311");
-    } else {
-        ESP_LOGI(TAG, "DAC7311 initialized successfully");
-        bluetooth_register_command_callback(ble_command_handler, dac);
-        dac7311_set_dc(dac, 0);
+    /* 800Hz 硬件定时器 + 高优 I2C 采样 */
+    g_sem = xSemaphoreCreateBinary();
+    if (g_sem && g_adc) {
+        xTaskCreatePinnedToCore(adc_task, "adc", 2048, NULL, 9, NULL, 0);
+        const esp_timer_create_args_t ta = {
+            .callback = adc_timer_cb,
+            .name     = "adc_t"
+        };
+        esp_timer_handle_t ht = NULL;
+        esp_timer_create(&ta, &ht);
+        esp_timer_start_periodic(ht, 1250); // 800Hz → 20点/25ms
+        ESP_LOGI(TAG, "ADC 800Hz timer ON");
     }
 
-    /* ---------- 主循环 ---------- */
-
-    while(1){
-        sensor_data_t sensor = {0};
-
-        /* --- 按键检测 --- */
-        if(key_is_pressed()){
-            led_toggle();
-            (void)bluetooth_send_key_event(1);
-        }
-
-        /* --- I2C 读取外部 ADC（每次循环都读）--- */
-        if (adc) {
-            uint16_t raw_value;
-            int16_t voltage_mv;
-
-            if (ads1013_read_raw(adc, &raw_value) == 0) {
-                voltage_mv = ads1013_raw_to_voltage_mv(raw_value, 4096);
-                sensor.adc_raw = raw_value;
-                sensor.adc_voltage_mv = voltage_mv;
-                sensor.adc_valid = true;
-            }
-        }
-
-        if (sensor.adc_valid) {
-            bluetooth_send_sensor_data(&sensor);
-        }
-
-        vTaskDelay(1);                      // 1 tick ≈ 10ms → 100 SPS
+    /* 主循环: 按键 */
+    while (1) {
+        if (key_is_pressed()) { led_toggle(); bluetooth_send_key_event(1); }
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
-
-    if (adc) ads1013_deinit(adc);
-    if (dac) dac7311_deinit(dac);
 }
