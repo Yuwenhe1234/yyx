@@ -95,7 +95,6 @@ void app_main(void)
     }
 
     /* ---------- 主循环 ---------- */
-    uint16_t adc_count = 0;
 
     while(1){
         sensor_data_t sensor = {0};
@@ -106,8 +105,8 @@ void app_main(void)
             (void)bluetooth_send_key_event(1);
         }
 
-        /* --- I2C 读取外部 ADC（每 500ms 一次）--- */
-        if (adc && adc_count % 5 == 0) {
+        /* --- I2C 读取外部 ADC（每次循环都读）--- */
+        if (adc) {
             uint16_t raw_value;
             int16_t voltage_mv;
 
@@ -116,7 +115,6 @@ void app_main(void)
                 sensor.adc_raw = raw_value;
                 sensor.adc_voltage_mv = voltage_mv;
                 sensor.adc_valid = true;
-                ESP_LOGI(TAG, "ADS1013 - Raw: %d, Voltage: %d mV", raw_value, voltage_mv);
             }
         }
 
@@ -124,8 +122,7 @@ void app_main(void)
             bluetooth_send_sensor_data(&sensor);
         }
 
-        adc_count++;
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(1);                      // 1 tick ≈ 10ms → 100 SPS
     }
 
     if (adc) ads1013_deinit(adc);

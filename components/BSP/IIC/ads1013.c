@@ -111,18 +111,18 @@ ads1013_handle_t* ads1013_init(void)
                   "recommended for reliable I2C communication at 100 kHz");
 
     // ---- 第 3 步：写配置寄存器，启动连续转换 ----
-    // 配置值 0x9283 各位含义：
+    // 配置值 0x92C3 各位含义：
     //   bit15   OS=1    (连续模式下无实际作用)
     //   bit14:12 MUX=000 (AIN0 vs GND，单端)
     //   bit11:9 PGA=001  (±4.096V 量程)
     //   bit8   MODE=0   (连续转换模式)
-    //   bit7:5 DR=100   (1600 次采样/秒)
+    //   bit7:5 DR=110   (3300 次采样/秒，芯片最高速率)
     //   bit4:0 =000_11  (比较器禁用)
     uint16_t config = (1 << ADS1013_OS_SHIFT)      |    // bit15=1
                       (0 << ADS1013_MUX_SHIFT)     |    // bit14:12=000 → AIN0 vs GND（单端）
                       (1 << ADS1013_PGA_SHIFT)     |    // bit11:9=001 → ±4.096V
                       (0 << ADS1013_MODE_SHIFT)    |    // bit8=0 → 连续转换
-                      (4 << ADS1013_DR_SHIFT)      |    // bit7:5=100 → 1600 SPS
+                      (6 << ADS1013_DR_SHIFT)      |    // bit7:5=110 → 3300 SPS
                       (3 << ADS1013_COMP_QUE_SHIFT);    // bit1:0=11 → 禁用比较器
 
     ret = ads1013_write_config(handle, config);

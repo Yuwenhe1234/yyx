@@ -349,6 +349,7 @@ static void streaming_task(void *param)
     (void)param;
     while (1) {
         if (g_notify_enabled && g_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+            // 每次 BLE 通知间隔改为 25ms = 40 SPS，确保手机端有足够的更新速率
             if (g_latest_sensor_data.adc_valid || g_latest_sensor_data.dac_valid) {
                 char buf[192];
                 const char *mode_str[] = {"DC", "SINE", "PULSE"};
@@ -367,7 +368,7 @@ static void streaming_task(void *param)
                 }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(100)); // 每100ms检查并发送
+        vTaskDelay(pdMS_TO_TICKS(25)); // 25ms = 40 SPS，匹配 BLE 连接间隔 (30ms 典型值)
     }
 }
 
